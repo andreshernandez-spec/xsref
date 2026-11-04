@@ -13,11 +13,17 @@ import scipy
 import subprocess
 import warnings
 
+
 from concurrent.futures import ProcessPoolExecutor
+from contextlib import contextmanager
+from contextvars import ContextVar
 from functools import partial
+from html import escape
+from io import StringIO
 from multiprocessing import Lock
 from multiprocessing import Manager
 from pathlib import Path
+from tempfile import TemporaryDirectory
 
 
 import xsref._reference._functions as xsref_funcs
@@ -25,9 +31,145 @@ import xsref._reference._functions as xsref_funcs
 from xsref.float_tools import extended_relative_error
 from xsref._reference._framework import XSRefFallbackWarning
 
+_table_revision = ContextVar("_table_revision", default=None)
+
+
+@contextmanager
+def _tables_at_commit(revision):
+    """Temporarily use reference tables from a Git revision."""
+    if revision is None:
+        yield
+        return
+
+    repo_root = Path(subprocess.check_output(
+        ["git", "-C", str(get_tables_path()), "rev-parse", "--show-toplevel"],
+        text=True,
+    ).strip())
+
+    commit = subprocess.check_output(
+        ["git", "-C", str(repo_root), "rev-parse", "--verify",
+         f"{revision}^{{commit}}"],
+        text=True,
+    ).strip()
+
+    with TemporaryDirectory() as tmpdir:
+        token = _table_revision.set((repo_root, commit, Path(tmpdir)))
+        try:
+            yield
+        finally:
+            _table_revision.reset(token)
+
+
+def _resolve_table_path(path):
+    """Resolve a table path against the active Git revision."""
+    state = _table_revision.get()
+
+    if state is None:
+        if not path.is_file():
+            raise FileNotFoundError(f"Table not found: {path}")
+        return path
+
+    repo_root, commit, tmpdir = state
+    relative_path = path.resolve().relative_to(repo_root)
+
+    historical_path = tmpdir / relative_path
+
+    if not historical_path.is_file():
+        result = subprocess.run(
+            ["git", "-C", str(repo_root), "show",
+             f"{commit}:{relative_path.as_posix()}"],
+            capture_output=True,
+        )
+
+        if result.returncode:
+            raise FileNotFoundError(
+                f"Table {relative_path} not found at commit {commit}."
+            )
+
+        historical_path.parent.mkdir(parents=True, exist_ok=True)
+        historical_path.write_bytes(result.stdout)
+
+    return historical_path
+
 
 def get_tables_path():
     return importlib.resources.files('xsref').joinpath('tables')
+
+
+def get_path_to_table(
+        function, table_type, *, family="scipy_special_tests", dtype_loop, platform
+):
+    """Return the path to a reference table.
+
+    Parameters
+    ----------
+    function : str
+        Function name, e.g. 'digamma'.
+    table_type : {'in', 'out', 'err'}
+        Type of table.
+    family : str, optional
+        Table family. Default is 'scipy_special_tests'.
+    dtype_loop : str
+        NumPy-style dtype loop, e.g. 'd->d' or 'D->D'.
+    platform : str
+        Platform identifier, e.g. 'gcc-linux-x86_64' or 'other'.
+        Only used for error tables.
+
+    Returns
+    -------
+    pathlib.Path
+        Path to the requested Parquet table.
+
+    Raises
+    ------
+    ValueError
+        If table_type is invalid.
+    FileNotFoundError
+        If the requested table does not exist.
+    """
+    if table_type not in ("in", "out", "err"):
+        raise ValueError(f"Unknown table type: {table_type!r}")
+
+    loop = _encode_dtype_loop(dtype_loop)
+
+    name = f"{table_type.capitalize()}_{loop}"
+    if table_type == "err":
+        name += f"_{platform}"
+
+    path = get_tables_path() / family / function / f"{name}.parquet"
+    return _resolve_table_path(path)
+
+
+def _get_vals_from_path(path):
+    """Load logical values from a Parquet table as NumPy arrays."""
+    table_type = path.name.split("_", 1)[0].lower()
+
+    if table_type == "in":
+        rows = get_input_rows(path)
+    elif table_type == "out":
+        rows = get_output_rows(path)
+    elif table_type == "err":
+        rows = pl.read_parquet(path).rows()
+    else:
+        raise ValueError(f"Unknown table type: {table_type!r}")
+
+    result = tuple(np.asarray(col) for col in zip(*rows))
+    if len(result) == 1:
+        result = result[0]
+    return result
+
+
+def _read_table(path):
+    """Read logical values and metadata from a Parquet table."""
+    values = _get_vals_from_path(path)
+
+    metadata = pq.read_schema(path).metadata or {}
+    metadata = {
+        key.decode("ascii"): value.decode("ascii")
+        for key, value in metadata.items()
+    }
+
+    return {"values": values, "metadata": metadata}
 
 
 def _process_arg(arg, typecode):
@@ -46,6 +188,20 @@ def _process_arg(arg, typecode):
             return np.complex128(arg[0], arg[1])
         case "_":
             raise ValueError(f"Received unhandled typecode: {typecode}")
+
+
+def _encode_dtype_loop(dtype_loop):
+    """Encode a NumPy dtype loop for use in table filenames."""
+    inputs, outputs = dtype_loop.split("->")
+
+    def encode(types):
+        return "_".join(
+            typecode.replace("F", "cf").replace("D", "cd")
+            for typecode in types
+        )
+
+    return f"{encode(inputs)}-{encode(outputs)}"
+
 
 
 def get_in_out_types(table_path):
@@ -142,6 +298,302 @@ def get_output_rows(table_path):
                 i += 1
         results.append(tuple(processed_row))
     return results
+
+
+def get_vals_from_table(
+        function, table_type, *, family="scipy_special_tests",
+        dtype_loop, platform, revision=None
+):
+    """Load reference values and metadata from a Parquet table.
+
+    Parameters
+    ----------
+    function : str
+        Function name, e.g. 'digamma'.
+    table_type : {'in', 'out', 'err'}
+        Type of table to load.
+    family : str, optional
+        Table family. Default is 'scipy_special_tests'.
+    dtype_loop : str
+        NumPy-style dtype loop, e.g. 'd->d' or 'D->D'.
+    platform : str
+        Platform identifier, e.g. 'gcc-linux-x86_64' or 'other'.
+        Only used for error tables.
+    revision : str, optional
+        Git revision from which to load the table. May be a commit hash,
+        branch name, or tag. If None (default), use the working tree.
+
+    Returns
+    -------
+    dict
+        Dictionary containing:
+
+        values : numpy.ndarray or tuple of numpy.ndarray
+            Logical table columns, with complex values reconstructed.
+            A single array is returned for a single logical column.
+        metadata : dict
+            Parquet schema metadata, with bytes keys and values.
+    """
+    with _tables_at_commit(revision):
+        path = get_path_to_table(
+            function, table_type, family=family,
+            dtype_loop=dtype_loop, platform=platform
+        )
+        return _read_table(path)
+
+
+def table_to_string(table):
+    """Format reference table metadata and values as text for diffing.
+
+    Parameters
+    ----------
+    table : dict
+        Dictionary returned by `get_vals_from_table`, containing
+        'values' and 'metadata'.
+
+    Returns
+    -------
+    str
+        Table metadata followed by values formatted as CSV.
+        Complex values are represented as strings.
+    """
+    buffer = StringIO()
+
+    buffer.write("# Metadata\n")
+    for key, value in sorted(table["metadata"].items()):
+        buffer.write(f"# {key}: {value}\n")
+
+    buffer.write("# Values (CSV)\n")
+    values = table["values"]
+    columns = values if isinstance(values, tuple) else (values,)
+
+    writer = csv.writer(buffer, lineterminator="\n")
+    writer.writerow(["row", *(f"value{i}" for i in range(len(columns)))])
+    writer.writerows((i, *row) for i, row in enumerate(zip(*columns)))
+
+    return buffer.getvalue()
+
+
+from difflib import unified_diff
+
+
+def get_table_diffs(revision1="main", revision2=None):
+    """Compare reference tables between two Git revisions.
+
+    Parameters
+    ----------
+    revision1, revision2 : str or None, optional
+        Git revisions to compare. May be commit hashes, branch names,
+        or tags. None denotes the current working tree. Defaults are
+        None (working tree) and 'main', respectively.
+
+    Returns
+    -------
+    dict of str to str
+        Dictionary mapping table paths relative to `get_tables_path()`
+        to unified diffs of their metadata and logical values.
+        Only tables with differences are included.
+    """
+    if revision1 is None and revision2 is None:
+        return {}
+
+    tables_path = Path(get_tables_path()).resolve()
+
+    repo_root = Path(subprocess.check_output(
+        ["git", "-C", str(tables_path), "rev-parse", "--show-toplevel"],
+        text=True,
+    ).strip())
+
+    relative_dir = tables_path.relative_to(repo_root).as_posix()
+
+    def git(*args):
+        return subprocess.check_output(
+            ["git", "-C", str(repo_root), *args]
+        )
+
+    def paths(output):
+        return {
+            os.fsdecode(path)
+            for path in output.split(b"\0")
+            if path
+        }
+
+    def resolve(revision):
+        if revision is None:
+            return None
+        return git(
+            "rev-parse", "--verify", f"{revision}^{{commit}}"
+        ).decode().strip()
+
+    commit1 = resolve(revision1)
+    commit2 = resolve(revision2)
+
+    # Find changed files, including untracked files when comparing
+    # against the working tree.
+    revisions = (
+        [commit1, commit2] if commit1 and commit2
+        else [commit1 or commit2]
+    )
+    changed = paths(git(
+        "diff", "--no-renames", "--name-only", "-z",
+        *revisions, "--", relative_dir,
+    ))
+
+    if commit1 is None or commit2 is None:
+        changed |= paths(git(
+            "ls-files", "--others", "--exclude-standard",
+            "-z", "--", relative_dir,
+        ))
+
+    def files_at_revision(commit):
+        if commit is None:
+            return None
+        return paths(git(
+            "ls-tree", "-r", "--name-only", "-z",
+            commit, "--", relative_dir,
+        ))
+
+    files1 = files_at_revision(commit1)
+    files2 = files_at_revision(commit2)
+
+    def render(path, relative_path, revision, files):
+        if files is None:
+            if not path.is_file():
+                return None
+        elif relative_path not in files:
+            return None
+
+        with _tables_at_commit(revision):
+            resolved_path = _resolve_table_path(path)
+            return table_to_string(_read_table(resolved_path))
+
+    diffs = {}
+
+    for relative_path in sorted(changed):
+        if not relative_path.endswith(".parquet"):
+            continue
+
+        path = repo_root / relative_path
+        table_name = path.relative_to(tables_path).as_posix()
+
+        text1 = render(path, relative_path, commit1, files1)
+        text2 = render(path, relative_path, commit2, files2)
+
+        diff = "".join(unified_diff(
+            (text1 or "").splitlines(keepends=True),
+            (text2 or "").splitlines(keepends=True),
+            fromfile=(
+                f"{revision1 or 'working tree'}:{table_name}"
+                if text1 is not None else "/dev/null"
+            ),
+            tofile=(
+                f"{revision2 or 'working tree'}:{table_name}"
+                if text2 is not None else "/dev/null"
+            ),
+        ))
+
+        if diff:
+            diffs[table_name] = diff
+
+    return diffs
+
+
+def format_table_diffs(
+    diffs, *, revision1="main", revision2=None, max_bytes=None
+):
+    """Format reference table diffs as a Markdown report.
+
+    Parameters
+    ----------
+    diffs : dict of str to str
+        Dictionary returned by `get_table_diffs`.
+    revision1, revision2 : str or None, optional
+        Revisions being compared. None denotes the working tree.
+        Defaults are 'main' and None, respectively.
+    max_bytes : int, optional
+        Maximum report size in bytes. If exceeded, omit some detailed
+        diffs while retaining the summary of all changed tables.
+
+    Returns
+    -------
+    str
+        GitHub-flavored Markdown report containing a summary table
+        and collapsible unified diffs.
+    """
+    def label(revision):
+        return "working tree" if revision is None else f"`{revision}`"
+
+    report = (
+        "# Reference Table Changes\n\n"
+        f"Comparing {label(revision1)} → {label(revision2)}\n\n"
+        f"**{len(diffs)} tables changed.**\n\n"
+    )
+
+    if not diffs:
+        return report + "No reference table changes detected.\n"
+
+    report += (
+        "## Summary\n\n"
+        "| Table | Values −/+ | Metadata −/+ |\n"
+        "| --- | ---: | ---: |\n"
+    )
+
+    for path, diff in sorted(diffs.items()):
+        counts = {
+            "values": [0, 0],
+            "metadata": [0, 0],
+        }
+
+        for line in diff.splitlines():
+            if line.startswith(("--- ", "+++ ")):
+                continue
+
+            if line.startswith(("-", "+")):
+                kind = (
+                    "metadata" if line[1:].startswith("# ")
+                    else "values"
+                )
+                index = 0 if line.startswith("-") else 1
+                counts[kind][index] += 1
+
+        values = counts["values"]
+        metadata = counts["metadata"]
+        name = escape(path).replace("|", "&#124;")
+
+        report += (
+            f"| <code>{name}</code> "
+            f"| {values[0]}/{values[1]} "
+            f"| {metadata[0]}/{metadata[1]} |\n"
+        )
+
+    report += "\n## Detailed Diffs\n\n"
+
+    omitted = 0
+
+    for path, diff in sorted(diffs.items()):
+        detail = (
+            "<details>\n"
+            f"<summary><code>{escape(path)}</code></summary>\n\n"
+            f"```diff\n{diff.rstrip()}\n```\n\n"
+            "</details>\n\n"
+        )
+
+        if (
+            max_bytes is not None
+            and len((report + detail).encode("utf-8")) > max_bytes - 512
+        ):
+            omitted += 1
+            continue
+
+        report += detail
+
+    if omitted:
+        report += (
+            f"\n**{omitted} detailed diffs omitted due to size.** "
+            "See the complete report in the workflow artifacts.\n"
+        )
+
+    return report
 
 
 def init(shared_lock):
